@@ -497,6 +497,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if not isinstance(function_args, dict):
             function_args = {}
 
+        # Rewrite emit_run_event cost/timestamp from metered truth before dispatch.
+        try:
+            from agent.agent_runtime_helpers import meter_run_event_payload
+            meter_run_event_payload(agent, function_name, function_args)
+        except Exception:
+            pass
+
         # Check plugin hooks for a block directive before executing.
         _block_msg: Optional[str] = None
         try:

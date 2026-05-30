@@ -1715,6 +1715,21 @@ def _run_single_child(
                 )
                 else 0.0
             ),
+            # Actual (ground-truth) cost for this child's OWN calls, plus the
+            # child's own sub-agent records, so the aggregator can roll the
+            # child's full subtree into a single flat record. Stripped before
+            # the dict is serialised back to the model.
+            "_child_actual_cost_usd": (
+                float(getattr(child, "session_actual_cost_usd", 0.0) or 0.0)
+                if isinstance(getattr(child, "session_actual_cost_usd", 0.0), (int, float))
+                else 0.0
+            ),
+            "_child_subagent_records": list(
+                getattr(child, "session_subagent_cost_records", None) or []
+            ),
+            "_child_reasoning_tokens": int(
+                getattr(child, "session_reasoning_tokens", 0) or 0
+            ),
         }
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
@@ -2254,14 +2269,49 @@ def delegate_task(
     # closed; we fold them into the parent in one pass alongside the
     # subagent_stop hook loop so we don't walk `results` twice.
     _children_cost_total = 0.0
+    _children_records = []
     for entry in results:
         child_role = entry.pop("_child_role", None)
         child_cost = entry.pop("_child_cost_usd", 0.0)
+        _child_actual = entry.pop("_child_actual_cost_usd", 0.0)
+        _child_subtree = entry.pop("_child_subagent_records", [])
+        _child_reasoning = entry.pop("_child_reasoning_tokens", 0)
         try:
             if child_cost:
                 _children_cost_total += float(child_cost)
         except (TypeError, ValueError):
             pass
+        try:
+            _subtree_total = sum(
+                float((r or {}).get("cost_usd") or 0.0) for r in (_child_subtree or [])
+            )
+        except (TypeError, ValueError, AttributeError):
+            _subtree_total = 0.0
+        _tokens = entry.get("tokens") or {}
+        # Name the sub-agent by its goal text (the meaningful attribution label
+        # the cost breakdown needs) — child_role is only ever the coerced
+        # "leaf"/"orchestrator" and collides across siblings. Fall back to role,
+        # then model, then a generic label. Truncate to keep the cost line short.
+        _goal = ""
+        try:
+            _ti = entry.get("task_index")
+            if isinstance(_ti, int) and 0 <= _ti < len(task_list):
+                _goal = (task_list[_ti].get("goal") or "").strip()
+        except (KeyError, IndexError, TypeError, AttributeError):
+            _goal = ""
+        _name = _goal[:80] if _goal else (child_role or entry.get("model") or "subagent")
+        # Failed/timed-out children flow through here too: their fabricated
+        # entries lack the _child_* keys and "tokens", so the .pop()/get()
+        # defaults above leave cost and token counts at 0 — a zero-cost record
+        # by design rather than a dropped one.
+        _children_records.append({
+            "name": str(_name or "subagent"),
+            "model": str(entry.get("model") or "unknown"),
+            "input_tokens": int((_tokens.get("input") or 0)),
+            "output_tokens": int((_tokens.get("output") or 0)),
+            "reasoning_tokens": int(_child_reasoning or 0),
+            "cost_usd": round(float(_child_actual or 0.0) + _subtree_total, 10),
+        })
         if _invoke_hook is None:
             continue
         try:
@@ -2297,6 +2347,13 @@ def delegate_task(
                 parent_agent.session_cost_status = "estimated"
         except Exception:
             logger.debug("Subagent cost rollup failed", exc_info=True)
+
+    if _children_records:
+        try:
+            _existing = list(getattr(parent_agent, "session_subagent_cost_records", None) or [])
+            parent_agent.session_subagent_cost_records = _existing + _children_records
+        except Exception:
+            logger.debug("Subagent cost-record capture failed", exc_info=True)
 
     total_duration = round(time.monotonic() - overall_start, 2)
 

@@ -30,7 +30,7 @@ import re
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1610,6 +1610,65 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
 
 
+_COST_EVENT_TYPES = {"run_completed", "cost_event"}
+
+
+def meter_run_event_payload(agent, function_name: str, function_args: dict) -> None:
+    """Overwrite an emit_run_event payload's timestamp/cost with metered truth.
+
+    Mutates ``function_args['event']`` in place. Timestamp is always replaced
+    with a runtime-authoritative UTC value; cost_usd + cost_breakdown are filled
+    from live session metrics for cost-bearing events and stripped from others.
+    No-op for any other tool. Never raises — metering must not break dispatch.
+    """
+    if function_name != "emit_run_event":
+        return
+    try:
+        event = function_args.get("event")
+        if not isinstance(event, dict):
+            return
+        event["timestamp"] = (
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+        if event.get("event_type") not in _COST_EVENT_TYPES:
+            event.pop("cost_usd", None)
+            event.pop("cost_breakdown", None)
+            return
+        self_cost = round(float(getattr(agent, "session_actual_cost_usd", 0.0) or 0.0), 10)
+        subs = []
+        for rec in (getattr(agent, "session_subagent_cost_records", None) or []):
+            try:
+                subs.append({
+                    "name": str((rec.get("name") or "subagent")),
+                    "model": str((rec.get("model") or getattr(agent, "model", "unknown") or "unknown")),
+                    "input_tokens": int(rec.get("input_tokens") or 0),
+                    "output_tokens": int(rec.get("output_tokens") or 0),
+                    "reasoning_tokens": int(rec.get("reasoning_tokens") or 0),
+                    "cost_usd": round(float(rec.get("cost_usd") or 0.0), 10),
+                })
+            except (TypeError, ValueError, AttributeError):
+                continue
+        subs_total = round(sum(s["cost_usd"] for s in subs), 10)
+        event["cost_breakdown"] = {
+            "self": {
+                "model": str(getattr(agent, "model", "unknown") or "unknown"),
+                "input_tokens": int(getattr(agent, "session_input_tokens", 0) or 0),
+                "output_tokens": int(getattr(agent, "session_output_tokens", 0) or 0),
+                "reasoning_tokens": int(getattr(agent, "session_reasoning_tokens", 0) or 0),
+                "cost_usd": self_cost,
+            },
+            "sub_agents": subs,
+        }
+        event["cost_usd"] = round(self_cost + subs_total, 10)
+    except Exception:
+        # Metering is best-effort; a failure here must not block the tool.
+        try:
+            from logging import getLogger
+            getLogger(__name__).debug("run-event metering failed", exc_info=True)
+        except Exception:
+            pass
+
+
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False) -> str:
@@ -1631,6 +1690,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             pass
     if block_message is not None:
         return json.dumps({"error": block_message}, ensure_ascii=False)
+
+    # Rewrite emit_run_event cost/timestamp from metered truth before dispatch.
+    meter_run_event_payload(agent, function_name, function_args)
 
     if function_name == "todo":
         from tools.todo_tool import todo_tool as _todo_tool

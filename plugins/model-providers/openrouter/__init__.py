@@ -43,6 +43,11 @@ class OpenRouterProfile(ProviderProfile):
         self, *, session_id: str | None = None, **context: Any
     ) -> dict[str, Any]:
         body: dict[str, Any] = {}
+        # Request OpenRouter usage accounting so every response carries the
+        # ground-truth ``usage.cost`` (and ``usage.cost_details``). This is the
+        # oracle the run-event metering adapter reads — without the flag the
+        # cost field is absent and we fall back to a token-price estimate.
+        body["usage"] = {"include": True}
         prefs = context.get("provider_preferences")
         if prefs:
             body["provider"] = prefs

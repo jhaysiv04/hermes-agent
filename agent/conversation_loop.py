@@ -64,7 +64,7 @@ from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
 from agent.trajectory import has_incomplete_scratchpad
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import accumulate_actual_cost, estimate_usage_cost, normalize_usage
 from hermes_constants import display_hermes_home as _dhh_fn, PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.schema_sanitizer import strip_pattern_and_format
@@ -1718,6 +1718,11 @@ def run_conversation(
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
+                    # Ground-truth cost from OpenRouter usage accounting. The
+                    # streaming path attaches the raw final-chunk usage object to
+                    # response.usage (chat_completion_helpers.py:1649), so its
+                    # .cost survives here. Tracked beside the estimate above.
+                    accumulate_actual_cost(agent, response.usage)
 
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI

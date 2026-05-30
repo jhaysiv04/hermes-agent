@@ -2667,5 +2667,187 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIsNone(kwargs["fallback_model"])
 
 
+class TestSubagentCostRecords(unittest.TestCase):
+    """delegate_task must record a structured actual-cost entry per sub-agent
+    on the parent's session_subagent_cost_records, with nested subtree cost
+    rolled into each entry."""
+
+    def _make_parent(self):
+        # Build on the shared harness so the parent carries every field
+        # delegate_task reads (base_url, _active_children_lock, etc.), then
+        # layer on the cost-record counters this task exercises.
+        parent = _make_mock_parent(depth=0)
+        parent.model = "deepseek/deepseek-v4-pro"
+        parent.session_estimated_cost_usd = 0.0
+        parent.session_cost_status = "unknown"
+        parent.session_cost_source = "none"
+        parent.session_subagent_cost_records = []
+        return parent
+
+    def test_single_child_record_captured(self):
+        parent = self._make_parent()
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.model = "deepseek/deepseek-v4-flash"
+            child.session_prompt_tokens = 8000
+            child.session_completion_tokens = 2000
+            child.session_reasoning_tokens = 0
+            child.session_estimated_cost_usd = 0.10
+            child.session_actual_cost_usd = 0.12
+            child.session_subagent_cost_records = []
+            child._delegate_role = "etsy"
+            child.run_conversation.return_value = {
+                "final_response": "done", "completed": True,
+            }
+            MockAgent.return_value = child
+            json.loads(delegate_task(goal="scan etsy", parent_agent=parent))
+
+        recs = parent.session_subagent_cost_records
+        self.assertEqual(len(recs), 1)
+        r = recs[0]
+        # The record name is sourced from the sub-agent's goal text (the
+        # meaningful cost-attribution label), not the coerced delegate role
+        # ("leaf"/"orchestrator") which collides across siblings.  Here the
+        # single task's goal is "scan etsy".
+        self.assertEqual(r["name"], "scan etsy")
+        self.assertEqual(r["model"], "deepseek/deepseek-v4-flash")
+        self.assertEqual(r["input_tokens"], 8000)
+        self.assertEqual(r["output_tokens"], 2000)
+        self.assertAlmostEqual(r["cost_usd"], 0.12, places=6)
+
+    def test_nested_subtree_cost_rolls_into_record(self):
+        parent = self._make_parent()
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.model = "deepseek/deepseek-v4-flash"
+            child.session_prompt_tokens = 5000
+            child.session_completion_tokens = 1500
+            child.session_reasoning_tokens = 0
+            child.session_estimated_cost_usd = 0.08
+            child.session_actual_cost_usd = 0.09           # child's OWN cost
+            child.session_subagent_cost_records = [          # child's grandchildren
+                {"name": "gc1", "model": "m", "input_tokens": 1, "output_tokens": 1,
+                 "reasoning_tokens": 0, "cost_usd": 0.03},
+            ]
+            child._delegate_role = "orchestrator"
+            child.run_conversation.return_value = {"final_response": "ok", "completed": True}
+            MockAgent.return_value = child
+            json.loads(delegate_task(goal="orchestrate", parent_agent=parent))
+
+        r = parent.session_subagent_cost_records[0]
+        # name comes from the goal text, not the coerced role
+        self.assertEqual(r["name"], "orchestrate")
+        # subtree total = own 0.09 + grandchild 0.03
+        self.assertAlmostEqual(r["cost_usd"], 0.12, places=6)
+
+    def test_multiple_children_distinct_records(self):
+        """N>1 children must each get their OWN record — no sibling name
+        collision, no cross-entry cost/token bleed.  This exercises the shared
+        aggregation loop with three siblings, which the single-child tests
+        above cannot cover.
+
+        Three distinct goals are dispatched in one batch delegate_task call.
+        The patched AIAgent is given a side_effect list so each task gets a
+        distinct child mock; children are built in task order (delegate_tool
+        iterates the task list and calls AIAgent() per task), so child[0]
+        serves task 0 ("scan etsy"), etc.  Records are sorted by task_index
+        before aggregation, so we assert by NAME (goal text) rather than
+        positionally — proving each child's cost/tokens land on its own goal.
+        """
+        parent = self._make_parent()
+
+        def _make_child(model, prompt_t, completion_t, reasoning_t, actual_cost, role):
+            c = MagicMock()
+            c.model = model
+            c.session_prompt_tokens = prompt_t
+            c.session_completion_tokens = completion_t
+            c.session_reasoning_tokens = reasoning_t
+            c.session_estimated_cost_usd = actual_cost
+            c.session_actual_cost_usd = actual_cost
+            c.session_subagent_cost_records = []
+            c._delegate_role = role
+            c.run_conversation.return_value = {
+                "final_response": "done", "completed": True,
+            }
+            return c
+
+        # Distinct goals, distinct actual costs, distinct token counts.
+        child_etsy = _make_child(
+            "deepseek/deepseek-v4-flash", 8000, 2000, 0, 0.10, "leaf"
+        )
+        child_pin = _make_child(
+            "deepseek/deepseek-v4-flash", 5000, 1700, 0, 0.17, "leaf"
+        )
+        child_seasonal = _make_child(
+            "deepseek/deepseek-v4-flash", 3000, 700, 0, 0.07, "leaf"
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            # side_effect (not return_value) so each task gets a distinct child.
+            MockAgent.side_effect = [child_etsy, child_pin, child_seasonal]
+            json.loads(
+                delegate_task(
+                    tasks=[
+                        {"goal": "scan etsy"},
+                        {"goal": "scan pinterest"},
+                        {"goal": "scan seasonal"},
+                    ],
+                    parent_agent=parent,
+                )
+            )
+
+        recs = parent.session_subagent_cost_records
+        self.assertEqual(len(recs), 3)
+
+        # Match by name — proves all three goals are present as distinct keys
+        # (no sibling name collision).
+        by_name = {r["name"]: r for r in recs}
+        self.assertEqual(set(by_name), {"scan etsy", "scan pinterest", "scan seasonal"})
+
+        # Each child's actual cost lands on its OWN goal's record (no bleed).
+        self.assertAlmostEqual(by_name["scan etsy"]["cost_usd"], 0.10, places=6)
+        self.assertAlmostEqual(by_name["scan pinterest"]["cost_usd"], 0.17, places=6)
+        self.assertAlmostEqual(by_name["scan seasonal"]["cost_usd"], 0.07, places=6)
+
+        # Per-child token counts land on the right record.
+        self.assertEqual(by_name["scan etsy"]["input_tokens"], 8000)
+        self.assertEqual(by_name["scan etsy"]["output_tokens"], 2000)
+        self.assertEqual(by_name["scan pinterest"]["input_tokens"], 5000)
+        self.assertEqual(by_name["scan pinterest"]["output_tokens"], 1700)
+        self.assertEqual(by_name["scan seasonal"]["input_tokens"], 3000)
+        self.assertEqual(by_name["scan seasonal"]["output_tokens"], 700)
+
+    def test_failed_child_produces_zero_cost_record(self):
+        """A failed/incomplete child (no final_response, completed=False) still
+        flows through the shared aggregation loop and produces a record, but
+        with cost_usd == 0.0 — the documented zero-record degradation.  The
+        child reports no actual cost, so the record's cost must be exactly 0."""
+        parent = self._make_parent()
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.model = "deepseek/deepseek-v4-flash"
+            child.session_prompt_tokens = 0
+            child.session_completion_tokens = 0
+            child.session_reasoning_tokens = 0
+            child.session_estimated_cost_usd = 0.0
+            child.session_actual_cost_usd = 0.0
+            child.session_subagent_cost_records = []
+            child._delegate_role = "leaf"
+            # No final_response + completed False => _run_single_child marks
+            # the child "failed".
+            child.run_conversation.return_value = {
+                "final_response": None, "completed": False,
+            }
+            MockAgent.return_value = child
+            json.loads(delegate_task(goal="scan etsy", parent_agent=parent))
+
+        recs = parent.session_subagent_cost_records
+        self.assertEqual(len(recs), 1)
+        r = recs[0]
+        # The failed child still produces a record, named by its goal.
+        self.assertEqual(r["name"], "scan etsy")
+        self.assertEqual(r["cost_usd"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

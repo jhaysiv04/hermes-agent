@@ -875,3 +875,24 @@ def format_token_count_compact(value: int) -> str:
             return f"{sign}{text}{suffix}"
 
     return f"{value:,}"
+
+
+def accumulate_actual_cost(agent, response_usage) -> None:
+    """Fold OpenRouter's ground-truth ``usage.cost`` into the session's
+    actual-cost counters.
+
+    No-op when the provider did not report a cost (non-OpenRouter routes, or
+    the usage-accounting flag was absent) or when the value is non-numeric.
+    Never touches ``session_estimated_cost_usd`` — actual cost is tracked in a
+    parallel field so existing analytics are undisturbed.
+    """
+    if response_usage is None:
+        return
+    cost = getattr(response_usage, "cost", None)
+    if cost is None:  # absent or explicitly null — provider did not report a cost
+        return
+    try:
+        agent.session_actual_cost_usd += float(cost)
+        agent.session_actual_cost_calls += 1
+    except (TypeError, ValueError, AttributeError):
+        pass

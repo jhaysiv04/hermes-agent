@@ -558,7 +558,13 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
-        
+        # Ground-truth cost from OpenRouter usage accounting, tracked beside the
+        # estimate above for the run-event metering adapter. session_actual_cost_usd
+        # is the parent's OWN calls only (sub-agents live in the records list).
+        self.session_actual_cost_usd = 0.0
+        self.session_actual_cost_calls = 0
+        self.session_subagent_cost_records = []
+
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
 
