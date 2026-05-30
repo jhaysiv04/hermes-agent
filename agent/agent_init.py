@@ -1533,7 +1533,13 @@ def init_agent(
     agent.session_estimated_cost_usd = 0.0
     agent.session_cost_status = "unknown"
     agent.session_cost_source = "none"
-    
+    # Ground-truth cost from OpenRouter usage accounting, tracked beside the
+    # estimate above for the run-event metering adapter. session_actual_cost_usd
+    # is the parent's OWN calls only (sub-agents live in the records list).
+    agent.session_actual_cost_usd = 0.0
+    agent.session_actual_cost_calls = 0
+    agent.session_subagent_cost_records = []
+
     # ── Ollama num_ctx injection ──
     # Ollama defaults to 2048 context regardless of the model's capabilities.
     # When running against an Ollama server, detect the model's max context
